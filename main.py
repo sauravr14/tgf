@@ -1,383 +1,698 @@
-import asyncio, logging, os, re, sqlite3
+import asyncio
+import logging
+import os
+import re
 from pathlib import Path
+
 from dotenv import load_dotenv
-from aiogram import Bot, Dispatcher, F
-from aiogram.filters import Command, CommandStart
-from aiogram.types import Message, CallbackQuery, InlineKeyboardButton
-from aiogram.utils.keyboard import InlineKeyboardBuilder
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
-from telethon.tl.types import DocumentAttributeFilename
+from telethon.tl.types import User, Chat, Channel, DocumentAttributeFilename
 from telethon.errors import FloodWaitError, RPCError
 
+from aiogram import Bot, Dispatcher, F
+from aiogram.filters import Command
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.exceptions import TelegramBadRequest
+
+import database as db
+
 load_dotenv()
-API_ID=int(os.environ["API_ID"]); API_HASH=os.environ["API_HASH"]
-SESSION_STRING=os.environ["SESSION_STRING"].strip()
-BOT_TOKEN=os.environ["BOT_TOKEN"].strip(); OWNER_ID=int(os.environ["OWNER_ID"])
-DB_PATH=os.environ.get("DB_PATH","/data/forwarder.sqlite3")
-logging.basicConfig(level=os.environ.get("LOG_LEVEL","INFO").upper(),
-                    format="%(asctime)s | %(levelname)s | %(message)s")
-log=logging.getLogger("forwarder")
 
-db=sqlite3.connect(DB_PATH,check_same_thread=False); db.row_factory=sqlite3.Row
-db.execute("PRAGMA journal_mode=WAL")
-db.executescript("""
-CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS sources(id INTEGER PRIMARY KEY AUTOINCREMENT,value TEXT UNIQUE NOT NULL,enabled INTEGER DEFAULT 1);
-CREATE TABLE IF NOT EXISTS destinations(id INTEGER PRIMARY KEY AUTOINCREMENT,value TEXT UNIQUE NOT NULL,enabled INTEGER DEFAULT 1);
-CREATE TABLE IF NOT EXISTS processed(source TEXT,message_id INTEGER,PRIMARY KEY(source,message_id));
-CREATE TABLE IF NOT EXISTS replacements(id INTEGER PRIMARY KEY AUTOINCREMENT,old_text TEXT,new_text TEXT,mode TEXT DEFAULT 'plain',enabled INTEGER DEFAULT 1);
-""")
-defaults={"enabled":"1","mode":"media","caption":"1","caption_prefix":"","caption_suffix":"",
-"remove_mentions":"0","filename":"1","filename_prefix":"","filename_suffix":"","delay":"2",
-"photos":"1","videos":"1","documents":"1","audio":"1","voice":"1","stickers":"0","animations":"1","text":"0",
-"backfill":"0","backfill_limit":"100"}
-for k,v in defaults.items(): db.execute("INSERT OR IGNORE INTO settings VALUES(?,?)",(k,v))
-db.commit()
+API_ID = int(os.environ["API_ID"])
+API_HASH = os.environ["API_HASH"]
+SESSION_STRING = os.environ["SESSION_STRING"]
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+OWNER_ID = int(os.environ["OWNER_ID"])
 
-def s(k): return db.execute("SELECT value FROM settings WHERE key=?",(k,)).fetchone()["value"]
-def setv(k,v): db.execute("INSERT OR REPLACE INTO settings VALUES(?,?)",(k,str(v))); db.commit()
-def on(k): return s(k)=="1"
-def add(table,v): db.execute(f"INSERT OR IGNORE INTO {table}(value) VALUES(?)",(v,)); db.commit()
-def remove(table,v): db.execute(f"DELETE FROM {table} WHERE value=?",(v,)); db.commit()
-def vals(table): return [r["value"] for r in db.execute(f"SELECT value FROM {table} WHERE enabled=1 ORDER BY id")]
-def processed(src,mid): return db.execute("SELECT 1 FROM processed WHERE source=? AND message_id=?",(src,mid)).fetchone() is not None
-def mark(src,mid):
-    try: db.execute("INSERT INTO processed VALUES(?,?)",(src,mid)); db.commit(); return True
-    except sqlite3.IntegrityError: return False
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+)
+log = logging.getLogger("tg-forwarder")
 
-def rules(): return db.execute("SELECT * FROM replacements WHERE enabled=1 ORDER BY id").fetchall()
-def transform(text):
-    if text is None: return None
-    out=text
-    for r in rules():
-        try: out=re.sub(r["old_text"],r["new_text"],out) if r["mode"]=="regex" else out.replace(r["old_text"],r["new_text"])
-        except re.error: log.exception("Invalid regex rule %s",r["id"])
-    if on("remove_mentions"): out=re.sub(r"(?<!\w)@[A-Za-z0-9_]{3,32}\b","",out)
-    if s("caption_prefix"): out=s("caption_prefix")+out
-    if s("caption_suffix"): out+=s("caption_suffix")
-    return out.strip()
+userbot = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
+bot = Bot(BOT_TOKEN)
+dp = Dispatcher()
 
-def filename(msg):
-    if not msg.document:return None
-    for a in msg.document.attributes:
-        if isinstance(a,DocumentAttributeFilename): return a.file_name
+SOURCE_ENTITIES = {}       # normalized entity id -> entity
+DEST_ENTITIES = {}         # normalized entity id -> entity
+SOURCE_REFS = {}           # ref -> entity
+DEST_REFS = {}             # ref -> entity
+RELOAD_LOCK = asyncio.Lock()
+SEND_LOCK = asyncio.Lock()
+
+def owner_only(message):
+    return message.from_user and message.from_user.id == OWNER_ID
+
+def clean_ref(ref):
+    ref = ref.strip()
+    if ref.startswith("https://t.me/") or ref.startswith("http://t.me/"):
+        ref = ref.split("t.me/", 1)[1].strip("/")
+        if "/" in ref:
+            ref = ref.split("/", 1)[0]
+    if ref.startswith("t.me/"):
+        ref = ref[5:].strip("/")
+    return ref
+
+def entity_type(e):
+    if isinstance(e, Channel):
+        return "channel" if getattr(e, "broadcast", False) else "supergroup"
+    if isinstance(e, Chat):
+        return "group"
+    if isinstance(e, User):
+        return "user"
+    return type(e).__name__.lower()
+
+def entity_id(e):
+    # For channels/supergroups this yields the -100... peer id.
+    return int(e.id) if isinstance(e, (Channel, Chat, User)) else None
+
+def display_name(e):
+    if isinstance(e, Channel):
+        return e.title or str(e.id)
+    if isinstance(e, Chat):
+        return e.title or str(e.id)
+    if isinstance(e, User):
+        return " ".join(x for x in [e.first_name, e.last_name] if x) or e.username or str(e.id)
+    return str(e)
+
+def username_of(e):
+    return getattr(e, "username", None)
+
+async def resolve_from_dialogs(ref):
+    """Resolve a reference using the logged-in account's actual dialogs first.
+
+    This is deliberately strict: a username that resolves to a User is not
+    accepted as a source/destination channel.
+    """
+    wanted = clean_ref(ref)
+    wanted_lower = wanted.lstrip("@").lower()
+
+    # Numeric refs: compare against Telethon peer ids and internal ids.
+    numeric = None
+    try:
+        numeric = int(wanted)
+    except ValueError:
+        pass
+
+    # First inspect dialogs. This is the reliable path for private channels
+    # because it uses entities already known to the logged-in account.
+    async for dialog in userbot.iter_dialogs():
+        e = dialog.entity
+        eid = entity_id(e)
+        uname = (username_of(e) or "").lower()
+        title = (display_name(e) or "").lower()
+
+        if numeric is not None:
+            if eid == numeric or eid == abs(numeric):
+                return e
+            # User may have pasted the positive channel id from Telethon.
+            if isinstance(e, Channel) and (eid == -100 * 10**(len(str(e.id))) + e.id):
+                pass
+
+        if wanted_lower in {uname, title, str(eid).lower()}:
+            return e
+        if uname and uname == wanted_lower.lstrip("@"):
+            return e
+
+    # Only after dialog scan do we try Telegram username resolution.
+    # Then validate that the result is a Channel/Chat rather than a User.
+    candidate = wanted
+    if candidate and not candidate.startswith("@") and not candidate.lstrip("-").isdigit():
+        candidate = "@" + candidate
+
+    try:
+        e = await userbot.get_entity(candidate)
+    except Exception as ex:
+        raise ValueError(f'Could not resolve "{ref}" through this Telegram account: {ex}') from ex
+
+    if isinstance(e, User):
+        raise ValueError(
+            f'"{ref}" resolved to USER "{display_name(e)}" (ID {e.id}), not a channel/group. '
+            f'Open/join the intended channel with the logged-in account, then run /reload.'
+        )
+    return e
+
+async def resolve_all():
+    async with RELOAD_LOCK:
+        SOURCE_ENTITIES.clear()
+        DEST_ENTITIES.clear()
+        SOURCE_REFS.clear()
+        DEST_REFS.clear()
+
+        sources = await db.list_entities("sources")
+        dests = await db.list_entities("destinations")
+
+        for ref, old_title, old_id, old_type, old_username in sources:
+            try:
+                e = await resolve_from_dialogs(ref)
+                if isinstance(e, User):
+                    raise ValueError("resolved to User")
+                eid = entity_id(e)
+                SOURCE_ENTITIES[eid] = e
+                SOURCE_REFS[ref] = e
+                await db.upsert_entity("sources", ref, display_name(e), eid, entity_type(e), username_of(e))
+                log.info("SOURCE READY | ref=%s | type=%s | title=%s | id=%s | username=@%s",
+                         ref, entity_type(e), display_name(e), eid, username_of(e) or "-")
+            except Exception as ex:
+                log.error("SOURCE FAILED | ref=%s | %s", ref, ex)
+
+        for ref, old_title, old_id, old_type, old_username in dests:
+            try:
+                e = await resolve_from_dialogs(ref)
+                if isinstance(e, User):
+                    raise ValueError("resolved to User")
+                eid = entity_id(e)
+                DEST_ENTITIES[eid] = e
+                DEST_REFS[ref] = e
+                await db.upsert_entity("destinations", ref, display_name(e), eid, entity_type(e), username_of(e))
+                log.info("DEST READY | ref=%s | type=%s | title=%s | id=%s | username=@%s",
+                         ref, entity_type(e), display_name(e), eid, username_of(e) or "-")
+            except Exception as ex:
+                log.error("DEST FAILED | ref=%s | %s", ref, ex)
+
+        log.info("RESOLUTION SUMMARY | sources=%d destinations=%d",
+                 len(SOURCE_ENTITIES), len(DEST_ENTITIES))
+
+async def transform_caption(text):
+    text = text or ""
+    replacements = await db.get_replacements()
+    for _, pattern, replacement, is_regex, target in replacements:
+        if target != "caption":
+            continue
+        try:
+            if is_regex:
+                text = re.sub(pattern, replacement, text)
+            else:
+                text = text.replace(pattern, replacement)
+        except re.error as ex:
+            log.error("Invalid regex rule #%s: %s", _, ex)
+
+    if await db.get_setting("remove_mentions", "0") == "1":
+        text = re.sub(r"(?<!\w)@[A-Za-z0-9_]{4,}", "", text)
+        text = re.sub(r"[ \t]{2,}", " ", text)
+    prefix = await db.get_setting("caption_prefix", "")
+    suffix = await db.get_setting("caption_suffix", "")
+    return f"{prefix}{text}{suffix}"
+
+async def transform_filename(name):
+    if not name:
+        return name
+    replacements = await db.get_replacements()
+    for _, pattern, replacement, is_regex, target in replacements:
+        if target != "filename":
+            continue
+        try:
+            name = re.sub(pattern, replacement, name) if is_regex else name.replace(pattern, replacement)
+        except re.error as ex:
+            log.error("Invalid filename regex rule #%s: %s", _, ex)
+    prefix = await db.get_setting("filename_prefix", "")
+    suffix = await db.get_setting("filename_suffix", "")
+    p = Path(name)
+    return f"{prefix}{p.stem}{suffix}{p.suffix}"
+
+async def get_original_filename(message):
+    if not message.document:
+        return None
+    for attr in message.document.attributes:
+        if isinstance(attr, DocumentAttributeFilename):
+            return attr.file_name
     return None
 
-def new_filename(name):
-    if not name or not on("filename"): return name
-    out=name
-    for r in rules():
-        try: out=re.sub(r["old_text"],r["new_text"],out) if r["mode"]=="regex" else out.replace(r["old_text"],r["new_text"])
-        except re.error: pass
-    return s("filename_prefix")+out+s("filename_suffix")
-
-def allowed(m):
-    if m.photo:return on("photos")
-    if m.video:return on("videos")
-    if m.audio:return on("audio")
-    if m.voice:return on("voice")
-    if m.sticker:return on("stickers")
-    if m.gif:return on("animations")
-    if m.document:return on("documents")
-    return on("text") and bool(m.text)
-
-def normalize(x):
-    x=x.strip()
-    if x.startswith("https://t.me/"):
-        tail=x.rstrip("/").split("/")[-1]
-        if not tail.startswith("+") and tail!="joinchat": return "@"+tail.lstrip("@")
-    return x
-
-async def resolve(client,ref):
-    ref=normalize(ref)
-    if re.fullmatch(r"-100\d+",ref):
-        wanted=int(ref)
-        async for d in client.iter_dialogs():
-            if getattr(d.entity,"id",None)==wanted:return d.entity
-        try:return await client.get_entity(wanted)
-        except Exception as e:
-            raise ValueError(f"Cannot resolve {ref}. The logged-in account must be a member of the channel. Open it in Telegram, then /reload and try /testid again.") from e
-    return await client.get_entity(ref)
-
-def name(e): return getattr(e,"title",None) or getattr(e,"username",None) or str(getattr(e,"id",e))
-
-bot=Bot(BOT_TOKEN); dp=Dispatcher(); userbot=None
-src_cache={}; dst_cache={}
-
-def menu():
-    b=InlineKeyboardBuilder()
-    b.row(InlineKeyboardButton(text="📊 Status",callback_data="status"),InlineKeyboardButton(text="⚙️ Settings",callback_data="settings"))
-    b.row(InlineKeyboardButton(text="📥 Sources",callback_data="sources"),InlineKeyboardButton(text="📤 Destinations",callback_data="dests"))
-    b.row(InlineKeyboardButton(text="✏️ Text Rules",callback_data="rules"),InlineKeyboardButton(text="🎛 Media",callback_data="media"))
-    b.row(InlineKeyboardButton(text="❓ Help",callback_data="help")); return b.as_markup()
-
-def settings_menu():
-    b=InlineKeyboardBuilder()
-    b.row(InlineKeyboardButton(text="🔄 ON/OFF",callback_data="toggle"),InlineKeyboardButton(text="📎 Mode",callback_data="mode"))
-    b.row(InlineKeyboardButton(text="📝 Caption",callback_data="caption"),InlineKeyboardButton(text="📁 Filename",callback_data="filename"))
-    b.row(InlineKeyboardButton(text="🎛 Media",callback_data="media"),InlineKeyboardButton(text="⏱ Delay",callback_data="delayhelp"))
-    b.row(InlineKeyboardButton(text="⬅️ Back",callback_data="home")); return b.as_markup()
-
-def media_menu():
-    b=InlineKeyboardBuilder()
-    for k,l in [("photos","Photos"),("videos","Videos"),("documents","Documents"),("audio","Audio"),("voice","Voice"),("stickers","Stickers"),("animations","Animations"),("text","Text")]:
-        b.button(text=("✅ " if on(k) else "❌ ")+l,callback_data="flip:"+k)
-    b.adjust(2); b.row(InlineKeyboardButton(text="⬅️ Settings",callback_data="settings")); return b.as_markup()
-
-def authorized(m): return m.from_user and m.from_user.id==OWNER_ID
-async def guard(m):
-    if not authorized(m): await m.answer("⛔ Not authorized."); return False
+async def allowed_message(message):
+    if not message.media:
+        return False
+    mode = await db.get_setting("media_filter", "all")
+    if mode == "documents" and not message.document:
+        return False
+    if mode == "videos" and not message.video:
+        return False
+    if mode == "photos" and not message.photo:
+        return False
     return True
 
-HELP="""<b>Advanced Forwarder Commands</b>
+async def deliver(message, mark=True):
+    if not SOURCE_ENTITIES:
+        log.warning("DELIVERY SKIPPED | no resolved sources")
+        return
+    if not DEST_ENTITIES:
+        log.warning("DELIVERY SKIPPED | no resolved destinations")
+        return
 
-<b>Channels</b>
-/addsource @channel | -100ID | t.me/link
-/delsource reference
-/sources
-/adddest @channel | -100ID | t.me/link
-/deldest reference
-/dests
-/testid -1001234567890
-/reload
+    source_id = int(message.chat_id)
+    if mark and await db.already_processed(source_id, message.id):
+        log.info("DUPLICATE SKIP | source=%s message=%s", source_id, message.id)
+        return
 
-<b>Forwarding</b>
-/on /off
-/mode media|forward
-/delay 2
+    if not await allowed_message(message):
+        log.info("FILTER SKIP | source=%s message=%s", source_id, message.id)
+        if mark:
+            await db.mark_processed(source_id, message.id)
+        return
 
-<b>Caption editing</b>
-/caption on|off
-/caption_prefix text
-/caption_suffix text
-/remove_mentions on|off
-/addreplace old | new
-/addregex pattern | replacement
-/rules
-/delrule ID
-/clearrules
+    mode = await db.get_setting("mode", "forward")
+    delay = float(await db.get_setting("delay", "11"))
 
-<b>Filename editing</b>
-/filename on|off
-/filename_prefix text
-/filename_suffix text
+    if mode == "forward":
+        # Native forwarding preserves Telegram's forward semantics but cannot
+        # change captions/filenames.
+        for dest in list(DEST_ENTITIES.values()):
+            async with SEND_LOCK:
+                try:
+                    await userbot.forward_messages(dest, message)
+                    log.info("FORWARDED | %s/%s -> %s/%s",
+                             source_id, message.id, entity_id(dest), display_name(dest))
+                except FloodWaitError as ex:
+                    log.warning("FLOOD WAIT | %ss", ex.seconds)
+                    await asyncio.sleep(ex.seconds)
+                    await userbot.forward_messages(dest, message)
+                except RPCError:
+                    log.exception("FORWARD FAILED | source=%s message=%s dest=%s",
+                                  source_id, message.id, entity_id(dest))
+            if delay > 0:
+                await asyncio.sleep(delay)
+    else:
+        # Media/reupload mode permits caption and filename transformations.
+        caption = await transform_caption(message.raw_text or "")
+        filename = await transform_filename(await get_original_filename(message))
+        tmpdir = Path("tmp")
+        tmpdir.mkdir(exist_ok=True)
+        path = None
+        try:
+            path = await userbot.download_media(message, file=str(tmpdir))
+            if not path:
+                log.warning("DOWNLOAD FAILED | source=%s message=%s", source_id, message.id)
+                return
+            send_file = path
+            if filename:
+                new_path = Path(path).with_name(filename)
+                Path(path).rename(new_path)
+                send_file = str(new_path)
+            for dest in list(DEST_ENTITIES.values()):
+                async with SEND_LOCK:
+                    try:
+                        await userbot.send_file(dest, send_file, caption=caption or None)
+                        log.info("REUPLOADED | %s/%s -> %s/%s",
+                                 source_id, message.id, entity_id(dest), display_name(dest))
+                    except FloodWaitError as ex:
+                        log.warning("FLOOD WAIT | %ss", ex.seconds)
+                        await asyncio.sleep(ex.seconds)
+                        await userbot.send_file(dest, send_file, caption=caption or None)
+                    except RPCError:
+                        log.exception("REUPLOAD FAILED | source=%s message=%s dest=%s",
+                                      source_id, message.id, entity_id(dest))
+                if delay > 0:
+                    await asyncio.sleep(delay)
+        finally:
+            if path:
+                try:
+                    p = Path(path)
+                    if p.exists():
+                        p.unlink()
+                except Exception:
+                    pass
 
-<b>Media</b>
-/toggle photo|video|document|audio|voice|sticker|animation|text
+    if mark:
+        await db.mark_processed(source_id, message.id)
 
-<b>History</b>
-/backfill on|off
-/backfill_limit 100
-/backfill_now
+@userbot.on(events.NewMessage())
+async def on_new_message(event):
+    try:
+        cid = int(event.chat_id)
+        log.info("EVENT | chat_id=%s message_id=%s", cid, event.id)
 
-<b>Other</b>
-/status
-/start
-/help"""
+        if cid not in SOURCE_ENTITIES:
+            return
 
-@dp.message(CommandStart())
-async def start(m):
-    if await guard(m): await m.answer("🚀 <b>Advanced Telegram Forwarder</b>",reply_markup=menu())
+        src = SOURCE_ENTITIES[cid]
+        log.info("SOURCE MATCH | title=%s id=%s message=%s media=%s",
+                 display_name(src), cid, event.id, bool(event.message.media))
+
+        if not event.message.media:
+            log.info("TEXT-ONLY SKIP | source=%s message=%s", cid, event.id)
+            return
+
+        asyncio.create_task(deliver(event.message))
+    except Exception:
+        log.exception("EVENT HANDLER ERROR")
+
+def panel():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Reload / Resolve", callback_data="reload")],
+        [InlineKeyboardButton(text="📥 Sources", callback_data="sources"),
+         InlineKeyboardButton(text="📤 Destinations", callback_data="dests")],
+        [InlineKeyboardButton(text="⚙️ Status", callback_data="status"),
+         InlineKeyboardButton(text="🧪 Debug", callback_data="debug")]
+    ])
+
+async def safe_edit(callback, text, reply_markup=None):
+    try:
+        await callback.message.edit_text(text, reply_markup=reply_markup, parse_mode="HTML")
+    except TelegramBadRequest as ex:
+        if "message is not modified" not in str(ex).lower():
+            raise
+    finally:
+        await callback.answer()
+
+def fmt_entity_rows(rows, resolved):
+    if not rows:
+        return "None"
+    out = []
+    for ref, title, eid, etype, username in rows:
+        e = resolved.get(eid)
+        if e:
+            out.append(f"• <b>{display_name(e)}</b> — <code>{eid}</code> — {entity_type(e)}")
+        else:
+            out.append(f"• <code>{ref}</code> — ❌ unresolved")
+    return "\n".join(out)
+
+@dp.message(Command("start"))
+async def start_cmd(message: Message):
+    if not owner_only(message):
+        return
+    await message.answer(
+        "🚀 <b>Telegram Forwarder</b>\n\n"
+        "Use the buttons or /help.\n"
+        "This build strictly validates that sources/destinations are channels/groups.",
+        parse_mode="HTML", reply_markup=panel()
+    )
+
 @dp.message(Command("help"))
-async def helpc(m):
-    if await guard(m): await m.answer(HELP,reply_markup=menu())
+async def help_cmd(message: Message):
+    if not owner_only(message):
+        return
+    await message.answer(
+        "<b>Commands</b>\n"
+        "/status /debug /reload\n"
+        "/sources /dests\n"
+        "/addsource REF\n/delsource REF\n"
+        "/adddest REF\n/deldest REF\n"
+        "/testid REF\n"
+        "/mode forward|media\n"
+        "/delay SECONDS\n"
+        "/caption_prefix TEXT\n/caption_suffix TEXT\n"
+        "/filename_prefix TEXT\n/filename_suffix TEXT\n"
+        "/remove_mentions on|off\n"
+        "/addreplace OLD =&gt; NEW\n"
+        "/addregex REGEX =&gt; REPLACEMENT\n"
+        "/rules /clearrules\n"
+        "/backfill LIMIT\n"
+        "/test REF\n",
+        parse_mode="HTML"
+    )
+
 @dp.message(Command("status"))
-async def statusc(m):
-    if await guard(m):
-        await m.answer(f"Bot: {'ON' if on('enabled') else 'OFF'}\nMode: {s('mode')}\nSources: {len(vals('sources'))}\nDestinations: {len(vals('destinations'))}\nDelay: {s('delay')}s\nBackfill: {'ON' if on('backfill') else 'OFF'}")
-@dp.message(Command("on"))
-async def onc(m):
-    if await guard(m): setv("enabled",1); await m.answer("✅ Forwarding ON")
-@dp.message(Command("off"))
-async def offc(m):
-    if await guard(m): setv("enabled",0); await m.answer("⏸ Forwarding OFF")
-@dp.message(Command("mode"))
-async def modec(m):
-    if not await guard(m):return
-    a=(m.text or "").split(maxsplit=1)
-    if len(a)==2 and a[1] in ("media","forward"):setv("mode",a[1]);await m.answer("✅ Mode: "+a[1])
-    else:await m.answer("Usage: /mode media OR /mode forward")
-@dp.message(Command("delay"))
-async def delayc(m):
-    if not await guard(m):return
-    try:setv("delay",max(0,float((m.text or "").split(maxsplit=1)[1])));await m.answer("✅ Delay: "+s("delay")+"s")
-    except:await m.answer("Usage: /delay 2")
+async def status_cmd(message: Message):
+    if not owner_only(message): return
+    mode = await db.get_setting("mode", "forward")
+    delay = await db.get_setting("delay", "11")
+    backfill = await db.get_setting("backfill", "on")
+    await message.answer(
+        f"Bot: ON\nMode: {mode}\nSources: {len(SOURCE_ENTITIES)} resolved\n"
+        f"Destinations: {len(DEST_ENTITIES)} resolved\nDelay: {delay}s\nBackfill: {backfill}"
+    )
+
+@dp.message(Command("debug"))
+async def debug_cmd(message: Message):
+    if not owner_only(message): return
+    srows = await db.list_entities("sources")
+    drows = await db.list_entities("destinations")
+    text = ["🔎 <b>DEBUG</b>", f"Userbot connected: {userbot.is_connected()}",
+            f"Resolved sources: {len(SOURCE_ENTITIES)}",
+            f"Resolved destinations: {len(DEST_ENTITIES)}", "", "<b>Sources</b>"]
+    for ref, title, eid, etype, username in srows:
+        e = SOURCE_REFS.get(ref)
+        text.append(f"• {ref} → {entity_type(e) if e else 'UNRESOLVED'} | "
+                    f"{display_name(e) if e else title or '-'} | ID {entity_id(e) if e else eid}")
+    text += ["", "<b>Destinations</b>"]
+    for ref, title, eid, etype, username in drows:
+        e = DEST_REFS.get(ref)
+        text.append(f"• {ref} → {entity_type(e) if e else 'UNRESOLVED'} | "
+                    f"{display_name(e) if e else title or '-'} | ID {entity_id(e) if e else eid}")
+    await message.answer("\n".join(text), parse_mode="HTML")
+
+@dp.message(Command("reload"))
+async def reload_cmd(message: Message):
+    if not owner_only(message): return
+    await resolve_all()
+    await message.answer(
+        f"🔄 Reload complete.\nSources resolved: {len(SOURCE_ENTITIES)}\n"
+        f"Destinations resolved: {len(DEST_ENTITIES)}"
+    )
+
+@dp.message(Command("sources"))
+async def sources_cmd(message: Message):
+    if not owner_only(message): return
+    rows = await db.list_entities("sources")
+    await message.answer("📥 <b>Sources</b>\n" + fmt_entity_rows(rows, SOURCE_ENTITIES), parse_mode="HTML")
+
+@dp.message(Command("dests"))
+async def dests_cmd(message: Message):
+    if not owner_only(message): return
+    rows = await db.list_entities("destinations")
+    await message.answer("📤 <b>Destinations</b>\n" + fmt_entity_rows(rows, DEST_ENTITIES), parse_mode="HTML")
+
+async def add_entity(message, table, arg):
+    ref = clean_ref(arg)
+    try:
+        e = await resolve_from_dialogs(ref)
+        if isinstance(e, User):
+            raise ValueError("resolved to a User, not a channel/group")
+        await db.upsert_entity(table, ref, display_name(e), entity_id(e), entity_type(e), username_of(e))
+        await resolve_all()
+        await message.answer(
+            f"✅ Added {entity_type(e)}\n<b>{display_name(e)}</b>\nID: <code>{entity_id(e)}</code>",
+            parse_mode="HTML"
+        )
+    except Exception as ex:
+        await message.answer(f"❌ {ex}")
 
 @dp.message(Command("addsource"))
-async def adds(m):
-    if await guard(m):
-        try:v=(m.text or "").split(maxsplit=1)[1];add("sources",v);await m.answer("✅ Source added: "+v)
-        except:await m.answer("Usage: /addsource @channel OR -100ID")
-@dp.message(Command("delsource"))
-async def dels(m):
-    if await guard(m):
-        try:v=(m.text or "").split(maxsplit=1)[1];remove("sources",v);src_cache.pop(v,None);await m.answer("✅ Source removed")
-        except:await m.answer("Usage: /delsource reference")
-@dp.message(Command("sources"))
-async def sourcec(m):
-    if await guard(m):await m.answer("📥 Sources:\n"+("\n".join(vals("sources")) or "None"))
+async def addsource_cmd(message: Message):
+    if not owner_only(message): return
+    arg = message.text.partition(" ")[2].strip()
+    if not arg:
+        await message.answer("Usage: /addsource @channel")
+        return
+    await add_entity(message, "sources", arg)
+
 @dp.message(Command("adddest"))
-async def addd(m):
-    if await guard(m):
-        try:v=(m.text or "").split(maxsplit=1)[1];add("destinations",v);await m.answer("✅ Destination added: "+v)
-        except:await m.answer("Usage: /adddest @channel OR -100ID")
+async def adddest_cmd(message: Message):
+    if not owner_only(message): return
+    arg = message.text.partition(" ")[2].strip()
+    if not arg:
+        await message.answer("Usage: /adddest @channel")
+        return
+    await add_entity(message, "destinations", arg)
+
+@dp.message(Command("delsource"))
+async def delsource_cmd(message: Message):
+    if not owner_only(message): return
+    arg = message.text.partition(" ")[2].strip()
+    await db.delete_entity("sources", clean_ref(arg))
+    await resolve_all()
+    await message.answer("✅ Source removed and resolver refreshed.")
+
 @dp.message(Command("deldest"))
-async def deld(m):
-    if await guard(m):
-        try:v=(m.text or "").split(maxsplit=1)[1];remove("destinations",v);dst_cache.pop(v,None);await m.answer("✅ Destination removed")
-        except:await m.answer("Usage: /deldest reference")
-@dp.message(Command("dests"))
-async def destc(m):
-    if await guard(m):await m.answer("📤 Destinations:\n"+("\n".join(vals("destinations")) or "None"))
+async def deldest_cmd(message: Message):
+    if not owner_only(message): return
+    arg = message.text.partition(" ")[2].strip()
+    await db.delete_entity("destinations", clean_ref(arg))
+    await resolve_all()
+    await message.answer("✅ Destination removed and resolver refreshed.")
+
 @dp.message(Command("testid"))
-async def testid(m):
-    if not await guard(m):return
+async def testid_cmd(message: Message):
+    if not owner_only(message): return
+    ref = message.text.partition(" ")[2].strip()
+    if not ref:
+        await message.answer("Usage: /testid @channel")
+        return
     try:
-        e=await resolve(userbot,(m.text or "").split(maxsplit=1)[1]);await m.answer(f"✅ Resolved: <b>{name(e)}</b>\nID: <code>{e.id}</code>")
-    except Exception as e:await m.answer("❌ "+str(e))
-@dp.message(Command("reload"))
-async def reloadc(m):
-    if await guard(m):src_cache.clear();dst_cache.clear();await m.answer("🔄 Entity cache cleared.")
+        e = await resolve_from_dialogs(ref)
+        await message.answer(
+            f"✅ <b>Resolved</b>\n"
+            f"Name: <b>{display_name(e)}</b>\n"
+            f"Type: <b>{entity_type(e)}</b>\n"
+            f"ID: <code>{entity_id(e)}</code>\n"
+            f"Username: <code>@{username_of(e) or '-'}</code>",
+            parse_mode="HTML"
+        )
+    except Exception as ex:
+        await message.answer(f"❌ {ex}")
 
-async def toggle_cmd(m,key):
-    if not await guard(m):return
+@dp.message(Command("mode"))
+async def mode_cmd(message: Message):
+    if not owner_only(message): return
+    mode = message.text.partition(" ")[2].strip().lower()
+    if mode not in {"forward", "media"}:
+        await message.answer("Usage: /mode forward or /mode media")
+        return
+    await db.set_setting("mode", mode)
+    await message.answer(f"✅ Mode: {mode}")
+
+@dp.message(Command("delay"))
+async def delay_cmd(message: Message):
+    if not owner_only(message): return
     try:
-        a=(m.text or "").split(maxsplit=1)[1].lower()
-        if a not in ("on","off"):raise ValueError
-        setv(key,int(a=="on"));await m.answer(f"✅ {key}: {a}")
-    except:await m.answer(f"Usage: /{key} on|off")
-@dp.message(Command("caption"))
-async def captionc(m):await toggle_cmd(m,"caption")
-@dp.message(Command("filename"))
-async def filenamec(m):await toggle_cmd(m,"filename")
-@dp.message(Command("remove_mentions"))
-async def mentionc(m):await toggle_cmd(m,"remove_mentions")
-@dp.message(Command("backfill"))
-async def backfillc(m):await toggle_cmd(m,"backfill")
-@dp.message(Command("backfill_limit"))
-async def blimit(m):
-    if await guard(m):
-        try:setv("backfill_limit",max(1,int((m.text or "").split(maxsplit=1)[1])));await m.answer("✅ Backfill limit: "+s("backfill_limit"))
-        except:await m.answer("Usage: /backfill_limit 100")
+        value = max(0, float(message.text.partition(" ")[2].strip()))
+        await db.set_setting("delay", value)
+        await message.answer(f"✅ Delay: {value}s")
+    except Exception:
+        await message.answer("Usage: /delay 11")
+
 @dp.message(Command("caption_prefix"))
-async def cpp(m):
-    if await guard(m):setv("caption_prefix",(m.text or "").split(maxsplit=1)[1] if " " in (m.text or "") else "");await m.answer("✅ Caption prefix updated")
+async def caption_prefix(message: Message):
+    if not owner_only(message): return
+    await db.set_setting("caption_prefix", message.text.partition(" ")[2])
+    await message.answer("✅ Caption prefix updated.")
+
 @dp.message(Command("caption_suffix"))
-async def cps(m):
-    if await guard(m):setv("caption_suffix",(m.text or "").split(maxsplit=1)[1] if " " in (m.text or "") else "");await m.answer("✅ Caption suffix updated")
+async def caption_suffix(message: Message):
+    if not owner_only(message): return
+    await db.set_setting("caption_suffix", message.text.partition(" ")[2])
+    await message.answer("✅ Caption suffix updated.")
+
 @dp.message(Command("filename_prefix"))
-async def fpp(m):
-    if await guard(m):setv("filename_prefix",(m.text or "").split(maxsplit=1)[1] if " " in (m.text or "") else "");await m.answer("✅ Filename prefix updated")
+async def filename_prefix(message: Message):
+    if not owner_only(message): return
+    await db.set_setting("filename_prefix", message.text.partition(" ")[2])
+    await message.answer("✅ Filename prefix updated.")
+
 @dp.message(Command("filename_suffix"))
-async def fps(m):
-    if await guard(m):setv("filename_suffix",(m.text or "").split(maxsplit=1)[1] if " " in (m.text or "") else "");await m.answer("✅ Filename suffix updated")
+async def filename_suffix(message: Message):
+    if not owner_only(message): return
+    await db.set_setting("filename_suffix", message.text.partition(" ")[2])
+    await message.answer("✅ Filename suffix updated.")
+
+@dp.message(Command("remove_mentions"))
+async def remove_mentions(message: Message):
+    if not owner_only(message): return
+    v = message.text.partition(" ")[2].strip().lower()
+    if v not in {"on", "off"}:
+        await message.answer("Usage: /remove_mentions on|off")
+        return
+    await db.set_setting("remove_mentions", "1" if v == "on" else "0")
+    await message.answer(f"✅ Remove mentions: {v}")
+
+async def add_rule(message, is_regex):
+    arg = message.text.partition(" ")[2]
+    if "=>" not in arg:
+        await message.answer("Usage: /addreplace OLD => NEW")
+        return
+    left, right = arg.split("=>", 1)
+    await db.add_replacement(left.strip(), right.strip(), is_regex, "caption")
+    await message.answer("✅ Rule added.")
+
 @dp.message(Command("addreplace"))
-async def addr(m):
-    if not await guard(m):return
-    try:a=(m.text or "").split(maxsplit=1)[1];old,new=[x.strip() for x in a.split("|",1)];db.execute("INSERT INTO replacements(old_text,new_text,mode) VALUES(?,?,?)",(old,new,"plain"));db.commit();await m.answer("✅ Replacement added")
-    except:await m.answer("Usage: /addreplace old | new")
+async def addreplace(message: Message):
+    if not owner_only(message): return
+    await add_rule(message, False)
+
 @dp.message(Command("addregex"))
-async def addrx(m):
-    if not await guard(m):return
-    try:a=(m.text or "").split(maxsplit=1)[1];old,new=[x.strip() for x in a.split("|",1)];re.compile(old);db.execute("INSERT INTO replacements(old_text,new_text,mode) VALUES(?,?,?)",(old,new,"regex"));db.commit();await m.answer("✅ Regex rule added")
-    except Exception as e:await m.answer("Usage: /addregex pattern | replacement\n"+str(e))
+async def addregex(message: Message):
+    if not owner_only(message): return
+    await add_rule(message, True)
+
 @dp.message(Command("rules"))
-async def rulesc(m):
-    if await guard(m):
-        rows=rules();await m.answer("✏️ Rules:\n"+("\n".join(f"{r['id']}: [{r['mode']}] {r['old_text']} → {r['new_text']}" for r in rows) or "None"))
-@dp.message(Command("delrule"))
-async def delrule(m):
-    if await guard(m):
-        try:i=int((m.text or "").split(maxsplit=1)[1]);db.execute("DELETE FROM replacements WHERE id=?",(i,));db.commit();await m.answer("✅ Deleted")
-        except:await m.answer("Usage: /delrule ID")
+async def rules_cmd(message: Message):
+    if not owner_only(message): return
+    rows = await db.get_replacements()
+    if not rows:
+        await message.answer("No rules.")
+        return
+    await message.answer("\n".join(
+        f"{rid}. {'REGEX' if rx else 'TEXT'}: {pat} => {rep}" for rid, pat, rep, rx, target in rows
+    ))
+
 @dp.message(Command("clearrules"))
-async def clear_rules(m):
-    if await guard(m):db.execute("DELETE FROM replacements");db.commit();await m.answer("🧹 Rules cleared")
-@dp.message(Command("toggle"))
-async def togglemedia(m):
-    if not await guard(m):return
-    mp={"photo":"photos","video":"videos","document":"documents","audio":"audio","voice":"voice","sticker":"stickers","animation":"animations","text":"text"}
-    try:k=mp[(m.text or "").split(maxsplit=1)[1].lower()];setv(k,int(not on(k)));await m.answer(f"✅ {k}: {'ON' if on(k) else 'OFF'}")
-    except:await m.answer("Usage: /toggle photo|video|document|audio|voice|sticker|animation|text")
-@dp.message(Command("backfill_now"))
-async def bnow(m):
-    if await guard(m):asyncio.create_task(backfill());await m.answer("🚀 Backfill started in background.")
+async def clearrules(message: Message):
+    if not owner_only(message): return
+    await db.clear_replacements()
+    await message.answer("✅ All replacement rules cleared.")
 
-async def backfill():
+@dp.message(Command("test"))
+async def test_cmd(message: Message):
+    if not owner_only(message): return
+    ref = message.text.partition(" ")[2].strip()
+    if not ref:
+        await message.answer("Usage: /test @source")
+        return
     try:
-        for ref in vals("sources"):
-            src=src_cache.get(ref) or await resolve(userbot,ref);src_cache[ref]=src
-            dsts=[]
-            for d in vals("destinations"):
-                e=dst_cache.get(d) or await resolve(userbot,d);dst_cache[d]=e;dsts.append(e)
-            async for msg in userbot.iter_messages(src,limit=int(s("backfill_limit")),reverse=True):
-                await process(ref,msg,dsts)
-    except Exception:log.exception("Backfill failed")
+        e = await resolve_from_dialogs(ref)
+        msgs = await userbot.get_messages(e, limit=1)
+        msg = msgs[0] if msgs else None
+        if not msg:
+            await message.answer("No message found.")
+            return
+        if not msg.media:
+            await message.answer(f"Latest message is text-only (ID {msg.id}).")
+            return
+        await deliver(msg, mark=False)
+        await message.answer(f"🧪 Test delivery attempted for {display_name(e)} message {msg.id}.")
+    except Exception as ex:
+        log.exception("TEST FAILED")
+        await message.answer(f"❌ Test failed: {ex}")
 
-async def process(ref,msg,dsts):
-    if not on("enabled") or not allowed(msg) or processed(ref,msg.id):return
-    try:
-        caption=transform(msg.text) if on("caption") else msg.text
-        for d in dsts:
-            if s("mode")=="forward":
-                await userbot.forward_messages(d,msg)
-            elif msg.document and on("filename") and filename(msg)!=new_filename(filename(msg)):
-                td=Path("/tmp/tgforward");td.mkdir(exist_ok=True)
-                p=Path(await userbot.download_media(msg,file=str(td)))
-                np=p.with_name(new_filename(filename(msg)));p.rename(np)
-                try:await userbot.send_file(d,str(np),caption=caption,force_document=True)
-                finally:
-                    try:np.unlink()
-                    except:pass
-            elif msg.media:
-                await userbot.send_file(d,msg.media,caption=caption,supports_streaming=bool(msg.video))
-            elif msg.text and on("text"):await userbot.send_message(d,caption)
-            await asyncio.sleep(float(s("delay")))
-        mark(ref,msg.id);log.info("Copied %s:%s",ref,msg.id)
-    except FloodWaitError as e:
-        log.warning("Flood wait %s seconds",e.seconds);await asyncio.sleep(e.seconds+2);await process(ref,msg,dsts)
-    except RPCError as e:log.error("Telegram error %s:%s: %s",ref,msg.id,e)
-    except Exception:log.exception("Copy failed %s:%s",ref,msg.id)
+@dp.callback_query(F.data == "reload")
+async def cb_reload(c: CallbackQuery):
+    if c.from_user.id != OWNER_ID:
+        await c.answer("Not allowed", show_alert=True); return
+    await resolve_all()
+    await safe_edit(c, f"🔄 Reloaded.\nSources: {len(SOURCE_ENTITIES)}\nDestinations: {len(DEST_ENTITIES)}",
+                    panel())
 
-@dp.callback_query()
-async def callbacks(c:CallbackQuery):
-    if c.from_user.id!=OWNER_ID:return await c.answer("Unauthorized",show_alert=True)
-    x=c.data
-    if x=="home":txt="🚀 <b>Advanced Forwarder</b>";kb=menu()
-    elif x=="status":txt=f"Bot: {'ON' if on('enabled') else 'OFF'}\nMode: {s('mode')}\nSources: {len(vals('sources'))}\nDestinations: {len(vals('destinations'))}\nDelay: {s('delay')}s";kb=menu()
-    elif x=="settings":txt="⚙️ Settings";kb=settings_menu()
-    elif x=="toggle":setv("enabled",int(not on("enabled")));txt="⚙️ Settings";kb=settings_menu()
-    elif x=="mode":setv("mode","forward" if s("mode")=="media" else "media");txt="Mode: "+s("mode");kb=settings_menu()
-    elif x=="media":txt="🎛 Media filters";kb=media_menu()
-    elif x.startswith("flip:"):setv(x[5:],int(not on(x[5:])));txt="🎛 Media filters";kb=media_menu()
-    elif x=="sources":txt="📥 Sources:\n"+("\n".join(vals("sources")) or "None");kb=menu()
-    elif x=="dests":txt="📤 Destinations:\n"+("\n".join(vals("destinations")) or "None");kb=menu()
-    elif x=="rules":rows=rules();txt="✏️ Rules:\n"+("\n".join(f"{r['id']}: {r['old_text']} → {r['new_text']}" for r in rows) or "None");kb=menu()
-    elif x=="caption":txt="📝 Caption editing is "+("ON" if on("caption") else "OFF")+"\nUse /addreplace or /addregex.";kb=settings_menu()
-    elif x=="filename":txt="📁 Filename editing is "+("ON" if on("filename") else "OFF")+"\nUse /addreplace or /addregex.";kb=settings_menu()
-    elif x=="delayhelp":txt="Use /delay SECONDS";kb=settings_menu()
-    else:txt=HELP;kb=menu()
-    await c.message.edit_text(txt,reply_markup=kb);await c.answer()
+@dp.callback_query(F.data == "sources")
+async def cb_sources(c: CallbackQuery):
+    if c.from_user.id != OWNER_ID:
+        await c.answer("Not allowed", show_alert=True); return
+    rows = await db.list_entities("sources")
+    await safe_edit(c, "📥 <b>Sources</b>\n" + fmt_entity_rows(rows, SOURCE_ENTITIES), panel())
 
-async def userbot_main():
-    global userbot
-    userbot=TelegramClient(StringSession(SESSION_STRING),API_ID,API_HASH);await userbot.start()
-    me=await userbot.get_me();log.info("Logged in as %s id=%s",getattr(me,"username",None),me.id)
-    try:
-        for r in vals("sources"):src_cache[r]=await resolve(userbot,r)
-        for r in vals("destinations"):dst_cache[r]=await resolve(userbot,r)
-    except Exception as e:log.warning("Entity resolution: %s",e)
-    if on("backfill"):await backfill()
-    @userbot.on(events.NewMessage)
-    async def handler(event):
-        for ref,e in list(src_cache.items()):
-            if getattr(e,"id",None)==getattr(event.chat,"id",None):
-                await process(ref,event.message,list(dst_cache.values()));break
-    await userbot.run_until_disconnected()
+@dp.callback_query(F.data == "dests")
+async def cb_dests(c: CallbackQuery):
+    if c.from_user.id != OWNER_ID:
+        await c.answer("Not allowed", show_alert=True); return
+    rows = await db.list_entities("destinations")
+    await safe_edit(c, "📤 <b>Destinations</b>\n" + fmt_entity_rows(rows, DEST_ENTITIES), panel())
+
+@dp.callback_query(F.data == "status")
+async def cb_status(c: CallbackQuery):
+    if c.from_user.id != OWNER_ID:
+        await c.answer("Not allowed", show_alert=True); return
+    mode = await db.get_setting("mode", "forward")
+    delay = await db.get_setting("delay", "11")
+    await safe_edit(c, f"🤖 <b>ON</b>\nMode: {mode}\nSources: {len(SOURCE_ENTITIES)}\nDestinations: {len(DEST_ENTITIES)}\nDelay: {delay}s", panel())
+
+@dp.callback_query(F.data == "debug")
+async def cb_debug(c: CallbackQuery):
+    if c.from_user.id != OWNER_ID:
+        await c.answer("Not allowed", show_alert=True); return
+    s = "\n".join(f"{k}: {display_name(v)} ({entity_type(v)})" for k,v in SOURCE_ENTITIES.items()) or "none"
+    d = "\n".join(f"{k}: {display_name(v)} ({entity_type(v)})" for k,v in DEST_ENTITIES.items()) or "none"
+    await safe_edit(c, f"🔎 <b>DEBUG</b>\n\n<b>Sources</b>\n{s}\n\n<b>Destinations</b>\n{d}", panel())
 
 async def main():
-    if not SESSION_STRING:raise RuntimeError("SESSION_STRING is empty")
-    await asyncio.gather(userbot_main(),dp.start_polling(bot))
+    await db.init_db()
+    await db.set_setting("mode", await db.get_setting("mode", "forward"))
+    await db.set_setting("delay", await db.get_setting("delay", "11"))
+    await userbot.connect()
 
-if __name__=="__main__":asyncio.run(main())
+    if not await userbot.is_user_authorized():
+        raise RuntimeError("Telethon session is not authorized. Generate a fresh session string.")
+
+    me = await userbot.get_me()
+    log.info("USERBOT READY | %s | id=%s", display_name(me), me.id)
+
+    await resolve_all()
+
+    if not SOURCE_ENTITIES:
+        log.warning("NO RESOLVED SOURCES. Use /addsource with a channel the logged-in account can access.")
+    if not DEST_ENTITIES:
+        log.warning("NO RESOLVED DESTINATIONS. Use /adddest with a channel/group the logged-in account can post to.")
+
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
