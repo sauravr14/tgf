@@ -1,0 +1,9 @@
+services:
+  forwarder:
+    build: .
+    container_name: tg-file-forwarder
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./data:/data
