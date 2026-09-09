@@ -1,1 +1,5 @@
-.env\ndata/\n__pycache__/\n*.pyc\n
+.env
+data/
+tmp/
+__pycache__/
+*.pyc

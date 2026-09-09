@@ -1,7 +1,10 @@
 services:
   forwarder:
     build: .
-    container_name: tg-advanced-forwarder
+    container_name: tg-advanced-forwarder-fixed
     restart: unless-stopped
-    env_file: [.env]
-    volumes: ["./data:/data"]
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+      - ./tmp:/app/tmp
